@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 )
 
-type UserID string
+type UserID string //fdkfl
 
 type Hub struct {
 	Clients     map[UserID]*Client // 用戶ID對應的Client
