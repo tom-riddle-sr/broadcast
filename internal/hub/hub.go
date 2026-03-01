@@ -1,47 +1,92 @@
 package hub
 
 import (
+	"hash/fnv"
 	"sync"
-	"sync/atomic"
 )
 
-type UserID string //fdkfl
+type UserID string
 
-type Hub struct {
-	Clients     map[UserID]*Client // 用戶ID對應的Client
-	mu          sync.RWMutex       // 用於保護Clients的讀寫操作
-	DroppedMsgs int64              // 紀錄因為Buffer滿了而被丟棄的訊息數
+// 定義分段數量，通常是 2 的次方 (如 32, 64)
+const shardCount = 32
+
+type ShardedHub struct {
+	shards []*shard
 }
 
-// 添加用戶到Hub
-func (h *Hub) AddClient(client *Client) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.Clients[UserID(client.ID)] = client
+type shard struct {
+	mu      sync.RWMutex
+	clients map[UserID]*Client
 }
 
-func (h *Hub) RemoveClient(client *Client) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+var slicePool = sync.Pool{
+	New: func() interface{} {
+		// 預設一個合適的容量，例如 512
+		s := make([]*Client, 0, 512)
+		return &s
+	},
+}
 
-	if _, exists := h.Clients[UserID(client.ID)]; !exists {
-		return //用戶不存在，無需移除
+func NewShardedHub() *ShardedHub {
+	h := &ShardedHub{
+		shards: make([]*shard, shardCount),
 	}
-
-	delete(h.Clients, UserID(client.ID))
-	client.Cancel()
+	for i := 0; i < shardCount; i++ {
+		h.shards[i] = &shard{
+			clients: make(map[UserID]*Client),
+		}
+	}
+	return h
 }
 
-func (h *Hub) Broadcast(message string) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+// getShard 根據 UserID 計算雜湊值，分散到不同的 Shard
+// 這樣可以降低簽名競爭，提高並行效能
+func (h *ShardedHub) getShard(id UserID) *shard {
+	hasher := fnv.New32a()
+	hasher.Write([]byte(id))
+	return h.shards[hasher.Sum32()%uint32(shardCount)]
+}
 
-	for _, client := range h.Clients {
-		select {
-		case client.MsgChan <- message:
-			//成功發送消息
-		default:
-			atomic.AddInt64(&h.DroppedMsgs, 1)
+func (h *ShardedHub) AddClient(c *Client) {
+	s := h.getShard(UserID(c.ID))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clients[UserID(c.ID)] = c
+}
+
+func (h *ShardedHub) RemoveClient(c *Client) {
+	s := h.getShard(UserID(c.ID))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.clients, UserID(c.ID))
+}
+
+func (h *ShardedHub) Broadcast(msg string) {
+	for _, s := range h.shards {
+		s.mu.RLock()
+		if len(s.clients) == 0 {
+			s.mu.RUnlock()
+			continue
 		}
+
+		// 從池子借一個 Slice 指標
+		p := slicePool.Get().(*[]*Client)
+		clients := (*p)[:0] // 重置長度，保留容量
+
+		for _, c := range s.clients {
+			clients = append(clients, c)
+		}
+		s.mu.RUnlock()
+
+		for _, c := range clients {
+			select {
+			case c.MsgChan <- msg:
+			default:
+			}
+		}
+
+		// 用完放回去，這一步最重要！
+		*p = clients
+		slicePool.Put(p)
 	}
 }

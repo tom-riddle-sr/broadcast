@@ -10,9 +10,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
-var globalHub *hub.Hub = &hub.Hub{
-	Clients: make(map[hub.UserID]*hub.Client),
-}
+var globalHub *hub.ShardedHub = hub.NewShardedHub()
 
 func main() {
 	// 啟動 pprof 服務器，監聽在 localhost:6060
